@@ -190,8 +190,7 @@ export const AuthorizePage = () => {
       <CardFooter className="flex flex-col items-stretch gap-3">
         <Button
           onClick={() => authorizeMutate()}
-          loading={authorizePending}
-          disabled={shouldAutoAuthorize}
+          loading={authorizePending || shouldAutoAuthorize}
         >
           {t("authorizeTitle")}
         </Button>

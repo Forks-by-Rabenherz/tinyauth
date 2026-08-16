@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"slices"
@@ -162,6 +163,10 @@ type OIDCService struct {
 		code      *cache.CacheStore[AuthorizeCodeEntry]
 		usedCode  *cache.CacheStore[UsedCodeEntry]
 		authorize *cache.CacheStore[AuthorizeRequest]
+	}
+
+	mus struct {
+		consent sync.RWMutex
 	}
 }
 
@@ -334,6 +339,11 @@ func NewOIDCService(i OIDCServiceInput) (*OIDCService, error) {
 		privateKey: privateKey,
 		publicKey:  rPublicKey,
 		issuer:     issuer,
+	}
+
+	// Remove consents for clients that are no longer configured
+	if err := service.reconcileOIDCConsents(context.Background()); err != nil {
+		i.Log.App.Warn().Err(err).Msg("Failed to reconcile OIDC consents")
 	}
 
 	// Start cleanup routine
@@ -920,7 +930,7 @@ func (service *OIDCService) DeleteAuthorizeRequestTicket(ticket string) {
 	service.caches.authorize.Delete(ticket)
 }
 
-// TODO: support signed request objects in the future
+// DecodeAuthorizeJWT TODO: support signed request objects in the future
 func (service *OIDCService) DecodeAuthorizeJWT(tokenString string) (*AuthorizeRequest, error) {
 	var claims jwt.MapClaims
 
@@ -969,4 +979,115 @@ func (service *OIDCService) GetPrompt(prompt string) []OIDCPrompt {
 	}
 
 	return parsedPromps
+}
+
+func (service *OIDCService) getOIDCConsentUnsafe(ctx context.Context, username, clientId string) (*repository.OidcConsent, error) {
+	entry, err := service.queries.GetOIDCConsentByUsernameAndClientID(ctx, repository.GetOIDCConsentByUsernameAndClientIDParams{
+		Username: username,
+		ClientID: clientId,
+	})
+
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get oidc consent: %w", err)
+	}
+
+	return &entry, nil
+}
+
+func (service *OIDCService) GetOIDCConsent(ctx context.Context, username, clientId string) (*repository.OidcConsent, error) {
+	service.mus.consent.RLock()
+	defer service.mus.consent.RUnlock()
+	return service.getOIDCConsentUnsafe(ctx, username, clientId)
+}
+
+func (service *OIDCService) UpsertOIDCConsent(ctx context.Context, username, scope, clientId string) (repository.OidcConsent, error) {
+	service.mus.consent.Lock()
+	defer service.mus.consent.Unlock()
+
+	existing, err := service.getOIDCConsentUnsafe(ctx, username, clientId)
+
+	if err != nil {
+		return repository.OidcConsent{}, err
+	}
+
+	merged := scope
+
+	if existing != nil {
+		merged = mergeScopes(existing.Scope, scope)
+	}
+
+	entry := repository.UpsertOIDCConsentParams{
+		Username:  username,
+		Scope:     merged,
+		ClientID:  clientId,
+		CreatedAt: time.Now().Unix(),
+	}
+
+	consent, err := service.queries.UpsertOIDCConsent(ctx, entry)
+
+	if err != nil {
+		service.log.App.Error().Err(err).Msg("Failed to upsert OIDC consent")
+		return repository.OidcConsent{}, err
+	}
+
+	return consent, nil
+}
+
+func (service *OIDCService) reconcileOIDCConsents(ctx context.Context) error {
+	consents, err := service.queries.ListOIDCConsents(ctx)
+
+	if err != nil {
+		return fmt.Errorf("failed to list oidc consents: %w", err)
+	}
+
+	cleaned := make(map[string]struct{})
+
+	for _, consent := range consents {
+		if _, ok := cleaned[consent.ClientID]; ok {
+			continue
+		}
+
+		cleaned[consent.ClientID] = struct{}{}
+
+		if _, ok := service.clients[consent.ClientID]; ok {
+			continue
+		}
+
+		service.log.App.Info().Str("clientId", consent.ClientID).Msg("Removed OIDC client no longer in configuration, deleting its consents")
+
+		if err := service.queries.DeleteOIDCConsentByClientID(ctx, consent.ClientID); err != nil {
+			service.log.App.Warn().Err(err).Str("clientId", consent.ClientID).Msg("Failed to delete OIDC consents for removed client")
+		}
+	}
+
+	return nil
+}
+
+func mergeScopes(existing, requested string) string {
+	set := make(map[string]struct{})
+
+	for _, scope := range strings.Split(existing, " ") {
+		if scope != "" {
+			set[scope] = struct{}{}
+		}
+	}
+
+	for _, scope := range strings.Split(requested, " ") {
+		if scope != "" {
+			set[scope] = struct{}{}
+		}
+	}
+
+	scopes := make([]string, 0, len(set))
+
+	for scope := range set {
+		scopes = append(scopes, scope)
+	}
+
+	slices.Sort(scopes)
+
+	return strings.Join(scopes, " ")
 }

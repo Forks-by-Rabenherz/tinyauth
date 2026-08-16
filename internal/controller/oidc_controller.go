@@ -242,6 +242,16 @@ func (controller *OIDCController) authorize(c *gin.Context) {
 		}
 	}
 
+	if userContext != nil && userContext.Authenticated && values.OIDCPrompt != service.OIDCPromptLogin {
+		consent, err := controller.oidc.GetOIDCConsent(c, userContext.GetUsername(), req.ClientID)
+
+		if err != nil {
+			controller.log.App.Warn().Err(err).Msg("Failed to get OIDC consent")
+		} else if consent != nil && scopesGranted(consent.Scope, req.Scope) {
+			values.OIDCPrompt = service.OIDCPromptNone
+		}
+	}
+
 	queries, err := query.Values(values)
 
 	if err != nil {
@@ -320,6 +330,19 @@ func (controller *OIDCController) authorizeComplete(c *gin.Context) {
 		return
 	}
 
+	// Get the client
+	client, ok := controller.oidc.GetClient(authorizeReq.ClientID)
+
+	if !ok {
+		controller.authorizeError(c, authorizeErrorParams{
+			err:          errors.New("client not found"),
+			reason:       "Client not found",
+			reasonPublic: "The client is not configured",
+			json:         true,
+		})
+		return
+	}
+
 	// We no longer need the ticket
 	controller.oidc.DeleteAuthorizeRequestTicket(req.Ticket)
 
@@ -354,6 +377,11 @@ func (controller *OIDCController) authorizeComplete(c *gin.Context) {
 			json:         true,
 		})
 		return
+	}
+
+	// Store the consent granted by the user for this client
+	if _, err := controller.oidc.UpsertOIDCConsent(c, userContext.GetUsername(), authorizeReq.Scope, client.ClientID); err != nil {
+		controller.log.App.Warn().Err(err).Msg("Failed to store OIDC consent")
 	}
 
 	q := cu.Query()
@@ -755,4 +783,21 @@ func (controller *OIDCController) resolveNormalParams(c *gin.Context) (*service.
 	}
 
 	return &req, nil
+}
+
+// scopesGranted reports whether every scope in requested is present in the
+// space-separated granted scope string.
+func scopesGranted(granted, requested string) bool {
+	grantedScopes := strings.Split(granted, " ")
+
+	for _, scope := range strings.Split(requested, " ") {
+		if scope == "" {
+			continue
+		}
+		if !slices.Contains(grantedScopes, scope) {
+			return false
+		}
+	}
+
+	return true
 }
